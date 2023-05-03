@@ -1,4 +1,4 @@
-<h1 align="center">RVC-WebUI</h1>
+<h1 align="center">RVC-WebUI-Song</h1>
 <div align="center">
 <p>
 
@@ -28,6 +28,18 @@ Double click `webui-user.bat` to start the webui.
 Run `webui.sh` to start the webui.
 
 <br >
+
+# How to use:
+
+## Put model files in .\models\checkpoints then refresh and choose a model
+
+## Use the Gradio web user interface and copy the path of the vocals of chosen song in Source Audio box
+
+## Copy the path of Faiss index that look like ```added_IVF208_Flat_nprobe_4.index``` under the Faiss index file path box
+
+## Copy the path of Big NPY that look like ```total_fea.npy``` under Big NPY file path box
+
+## Click infer
 
 ```
 Tested environment: Windows 10, Python 3.10.9, torch 2.0.0+cu118
