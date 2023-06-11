@@ -3,11 +3,11 @@ import traceback
 from concurrent.futures import ProcessPoolExecutor
 from typing import *
 
-import librosa
 import numpy as np
-import parselmouth
 import pyworld
 from tqdm import tqdm
+
+from lib.rvc.utils import load_audio
 
 
 def compute_f0(
@@ -18,42 +18,23 @@ def compute_f0(
     f0_max: float,
     f0_min: float,
 ):
-    x, sr = librosa.load(path, sr=fs, res_type="soxr_vhq")
-    p_len = x.shape[0] // hop
-    assert sr == fs
-    if f0_method == "pm":
-        time_step = 160 / 16000 * 1000
-        f0_max = 1100
-        f0_min = 50
-        f0 = (
-            parselmouth.Sound(x, sr)
-            .to_pitch_ac(
-                time_step=time_step / 1000,
-                voicing_threshold=0.6,
-                pitch_floor=f0_min,
-                pitch_ceiling=f0_max,
-            )
-            .selected_array["frequency"]
-        )
-        pad_size = (p_len - len(f0) + 1) // 2
-        if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-            f0 = np.pad(f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant")
-    elif f0_method == "harvest":
+    x = load_audio(path, fs)
+    if f0_method == "harvest":
         f0, t = pyworld.harvest(
             x.astype(np.double),
-            fs=sr,
+            fs=fs,
             f0_ceil=f0_max,
             f0_floor=f0_min,
-            frame_period=1000 * hop / sr,
+            frame_period=1000 * hop / fs,
         )
         f0 = pyworld.stonemask(x.astype(np.double), f0, t, fs)
     elif f0_method == "dio":
         f0, t = pyworld.dio(
             x.astype(np.double),
-            fs=sr,
+            fs=fs,
             f0_ceil=f0_max,
             f0_floor=f0_min,
-            frame_period=1000 * hop / sr,
+            frame_period=1000 * hop / fs,
         )
         f0 = pyworld.stonemask(x.astype(np.double), f0, t, fs)
     return f0

@@ -4,15 +4,13 @@ from typing import *
 
 import faiss
 import numpy as np
-import parselmouth
 import pyworld
 import scipy.signal as signal
 import torch
 import torch.nn.functional as F
+
 # from faiss.swigfaiss_avx2 import IndexIVFFlat # cause crash on windows' faiss-cpu installed from pip
 from fairseq.models.hubert import HubertModel
-from transformers import HubertModel as TrHubertModel
-from transformers import Wav2Vec2FeatureExtractor
 
 from .models import SynthesizerTrnMs256NSFSid
 
@@ -61,28 +59,12 @@ class VocalConvertPipeline(object):
         f0_method: str,
         inp_f0: np.ndarray = None,
     ):
-        time_step = self.window / self.sr * 1000
         f0_min = 50
         f0_max = 1100
         f0_mel_min = 1127 * np.log(1 + f0_min / 700)
         f0_mel_max = 1127 * np.log(1 + f0_max / 700)
-        if f0_method == "pm":
-            f0 = (
-                parselmouth.Sound(x, self.sr)
-                .to_pitch_ac(
-                    time_step=time_step / 1000,
-                    voicing_threshold=0.6,
-                    pitch_floor=f0_min,
-                    pitch_ceiling=f0_max,
-                )
-                .selected_array["frequency"]
-            )
-            pad_size = (p_len - len(f0) + 1) // 2
-            if pad_size > 0 or p_len - len(f0) - pad_size > 0:
-                f0 = np.pad(
-                    f0, [[pad_size, p_len - len(f0) - pad_size]], mode="constant"
-                )
-        elif f0_method == "harvest":
+
+        if f0_method == "harvest":
             f0, t = pyworld.harvest(
                 x.astype(np.double),
                 fs=self.sr,
@@ -92,6 +74,17 @@ class VocalConvertPipeline(object):
             )
             f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.sr)
             f0 = signal.medfilt(f0, 3)
+        elif f0_method == "dio":
+            f0, t = pyworld.dio(
+                x.astype(np.double),
+                fs=self.sr,
+                f0_ceil=f0_max,
+                f0_floor=f0_min,
+                frame_period=10,
+            )
+            f0 = pyworld.stonemask(x.astype(np.double), f0, t, self.sr)
+            f0 = signal.medfilt(f0, 3)
+
         f0 *= pow(2, f0_up_key / 12)
         tf0 = self.sr // self.window  # f0 points per second
         if inp_f0 is not None:
@@ -118,7 +111,8 @@ class VocalConvertPipeline(object):
 
     def _convert(
         self,
-        model: Union[HubertModel, Tuple[Wav2Vec2FeatureExtractor, TrHubertModel]],
+        model: HubertModel,
+        embedding_output_layer: int,
         net_g: SynthesizerTrnMs256NSFSid,
         sid: int,
         audio: np.ndarray,
@@ -139,6 +133,10 @@ class VocalConvertPipeline(object):
         feats = feats.view(1, -1)
         padding_mask = torch.BoolTensor(feats.shape).to(self.device).fill_(False)
 
+        half_support = (
+            self.device.type == "cuda"
+            and torch.cuda.get_device_capability(self.device)[0] >= 5.3
+        )
         is_feats_dim_768 = net_g.emb_channels == 768
 
         if isinstance(model, tuple):
@@ -157,19 +155,17 @@ class VocalConvertPipeline(object):
                 else:
                     feats = model[1](feats).extract_features
         else:
-            inputs = (
-                {
-                    "source": feats.to(self.device),
-                    "padding_mask": padding_mask,
-                    "output_layer": 9,  # layer 9
-                }
-                if not is_feats_dim_768
-                else {
-                    "source": feats.to(self.device),
-                    "padding_mask": padding_mask,
-                    # no pass "output_layer"
-                }
-            )
+            inputs = {
+                "source": feats.half().to(self.device)
+                if half_support
+                else feats.to(self.device),
+                "padding_mask": padding_mask.to(self.device),
+                "output_layer": embedding_output_layer,
+            }
+
+            if not half_support:
+                model = model.float()
+                inputs["source"] = inputs["source"].float()
 
             with torch.no_grad():
                 logits = model.extract_features(**inputs)
@@ -186,8 +182,12 @@ class VocalConvertPipeline(object):
             npy = feats[0].cpu().numpy()
             if self.is_half:
                 npy = npy.astype("float32")
-            D, I = index.search(npy, 1)
-            npy = big_npy[I.squeeze()]
+
+            score, ix = index.search(npy, k=8)
+            weight = np.square(1 / score)
+            weight /= weight.sum(axis=1, keepdims=True)
+            npy = np.sum(big_npy[ix] * np.expand_dims(weight, axis=2), axis=1)
+
             if self.is_half:
                 npy = npy.astype("float16")
             feats = (
@@ -228,29 +228,23 @@ class VocalConvertPipeline(object):
 
     def __call__(
         self,
-        model: Union[HubertModel, Tuple[Wav2Vec2FeatureExtractor, TrHubertModel]],
+        model: HubertModel,
+        embedding_output_layer: int,
         net_g: SynthesizerTrnMs256NSFSid,
         sid: int,
         audio: np.ndarray,
         transpose: int,
         f0_method: str,
         file_index: str,
-        file_big_npy: str,
         index_rate: float,
         if_f0: bool,
         f0_file: str = None,
     ):
-        if (
-            file_big_npy != ""
-            and file_index != ""
-            and os.path.exists(file_big_npy)
-            and os.path.exists(file_index)
-            and index_rate != 0
-        ):
+        if file_index != "" and os.path.exists(file_index) and index_rate != 0:
             try:
                 index = faiss.read_index(file_index)
-                big_npy = np.load(file_big_npy)
-                print(f"Loaded {file_index} and {file_big_npy}")
+                # big_npy = np.load(file_big_npy)
+                big_npy = index.reconstruct_n(0, index.ntotal)
             except:
                 traceback.print_exc()
                 index = big_npy = None
@@ -311,6 +305,7 @@ class VocalConvertPipeline(object):
                 audio_opt.append(
                     self._convert(
                         model,
+                        embedding_output_layer,
                         net_g,
                         sid,
                         audio_pad[s : t + self.t_pad2 + self.window],
@@ -325,6 +320,7 @@ class VocalConvertPipeline(object):
                 audio_opt.append(
                     self._convert(
                         model,
+                        embedding_output_layer,
                         net_g,
                         sid,
                         audio_pad[s : t + self.t_pad2 + self.window],
@@ -340,6 +336,7 @@ class VocalConvertPipeline(object):
             audio_opt.append(
                 self._convert(
                     model,
+                    embedding_output_layer,
                     net_g,
                     sid,
                     audio_pad[t:],
@@ -354,6 +351,7 @@ class VocalConvertPipeline(object):
             audio_opt.append(
                 self._convert(
                     model,
+                    embedding_output_layer,
                     net_g,
                     sid,
                     audio_pad[t:],

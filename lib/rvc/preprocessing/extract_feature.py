@@ -10,8 +10,22 @@ import torch
 import torch.nn.functional as F
 from fairseq import checkpoint_utils
 from tqdm import tqdm
-from transformers import HubertModel as TrHubertModel
-from transformers import Wav2Vec2FeatureExtractor
+
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+MODELS_DIR = os.path.join(ROOT_DIR, "models")
+EMBEDDINGS_LIST = {
+    "hubert-base-japanese": (
+        "rinna_hubert_base_jp.pt",
+        "hubert-base-japanese",
+        "local",
+    ),
+    "contentvec": ("checkpoint_best_legacy_500.pt", "contentvec", "local"),
+}
+
+def get_embedder(embedder_name):
+    if embedder_name in EMBEDDINGS_LIST:
+        return EMBEDDINGS_LIST[embedder_name]
+    return None
 
 
 def load_embedder(embedder_path: str, device):
@@ -34,42 +48,6 @@ def load_embedder(embedder_path: str, device):
     return embedder_model, cfg
 
 
-def load_transformers_hubert(repo_name: str, device):
-    try:
-        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(repo_name)
-        embedder_model = TrHubertModel.from_pretrained(repo_name).to(device)
-        if device != "cpu":
-            embedder_model = embedder_model.half()
-        else:
-            embedder_model = embedder_model.float()
-        embedder_model.eval()
-    except Exception as e:
-        print(f"Error: {e} {repo_name}")
-        traceback.print_exc()
-
-    return (feature_extractor, embedder_model), None
-
-
-def load_transformers_hubert_local(embedder_path: str, device):
-    try:
-        feature_extractor = Wav2Vec2FeatureExtractor.from_pretrained(
-            embedder_path, local_files_only=True
-        )
-        embedder_model = TrHubertModel.from_pretrained(
-            embedder_path, local_files_only=True
-        ).to(device)
-        if device != "cpu":
-            embedder_model = embedder_model.half()
-        else:
-            embedder_model = embedder_model.float()
-        embedder_model.eval()
-    except Exception as e:
-        print(f"Error: {e} {embedder_path}")
-        traceback.print_exc()
-
-    return (feature_extractor, embedder_model), None
-
-
 # wave must be 16k, hop_size=320
 def readwave(wav_path, normalize=False):
     wav, sr = sf.read(wav_path)
@@ -90,22 +68,21 @@ def processor(
     device: torch.device,
     embedder_path: str,
     embedder_load_from: str,
-    is_feats_dim_768: bool,
+    embedding_channel: bool,
+    embedding_output_layer: int,
     wav_dir: str,
     out_dir: str,
     process_id: int,
 ):
-    half_support = device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 5.3
+    half_support = (
+        device.type == "cuda" and torch.cuda.get_device_capability(device)[0] >= 5.3
+    )
+    is_feats_dim_768 = embedding_channel == 768
 
     if embedder_load_from == "local" and not os.path.exists(embedder_path):
         return f"Embedder not found: {embedder_path}"
 
-    if embedder_load_from == "hf":
-        model, cfg = load_transformers_hubert(embedder_path, device)
-    elif embedder_load_from == "tr-local":
-        model, cfg = load_transformers_hubert_local(embedder_path, device)
-    else:
-        model, cfg = load_embedder(embedder_path, device)
+    model, cfg = load_embedder(embedder_path, device)
 
     for file in tqdm(todo, position=1 + process_id):
         try:
@@ -144,23 +121,13 @@ def processor(
                             else:
                                 feats = model[1].float()(feats).extract_features
                 else:
-                    inputs = (
-                        {
-                            "source": feats.half().to(device)
-                            if half_support
-                            else feats.to(device),
-                            "padding_mask": padding_mask.to(device),
-                            "output_layer": 9,  # layer 9
-                        }
-                        if not is_feats_dim_768
-                        else {
-                            "source": feats.half().to(device)
-                            if half_support
-                            else feats.to(device),
-                            "padding_mask": padding_mask.to(device),
-                            # no pass "output_layer"
-                        }
-                    )
+                    inputs = {
+                        "source": feats.half().to(device)
+                        if half_support
+                        else feats.to(device),
+                        "padding_mask": padding_mask.to(device),
+                        "output_layer": embedding_output_layer,
+                    }
 
                     # なんかまだこの時点でfloat16なので改めて変換
                     if not half_support:
@@ -188,7 +155,8 @@ def run(
     training_dir: str,
     embedder_path: str,
     embedder_load_from: str,
-    is_feats_dim_768: bool,
+    embedding_channel: int,
+    embedding_output_layer: int,
     gpu_ids: List[int],
     device: Optional[Union[torch.device, str]] = None,
 ):
@@ -218,13 +186,16 @@ def run(
         if type(device) == str:
             device = torch.device(device)
         if device.type == "mps":
-            device = torch.device("cpu") # Mac(MPS) crashes when multiprocess, so change to CPU.
+            device = torch.device(
+                "cpu"
+            )  # Mac(MPS) crashes when multiprocess, so change to CPU.
         processor(
             todo,
             device,
             embedder_path,
             embedder_load_from,
-            is_feats_dim_768,
+            embedding_channel,
+            embedding_output_layer,
             wav_dir,
             out_dir,
             process_id=0,
@@ -238,7 +209,8 @@ def run(
                     torch.device(f"cuda:{id}"),
                     embedder_path,
                     embedder_load_from,
-                    is_feats_dim_768,
+                    embedding_channel,
+                    embedding_output_layer,
                     wav_dir,
                     out_dir,
                     process_id=i,
